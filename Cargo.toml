@@ -1,0 +1,23 @@
+[package]
+name = "nginx-dovecot-auth"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nginx_dovecot_auth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nginx-dovecot-auth"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql"] }
+argon2 = "0.5"
+md-5 = "0.10"
+base64 = "0.22"
+subtle = "2.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
