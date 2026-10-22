@@ -11,7 +11,8 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
     MySqlPool,
 };
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, time::Instant};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
 struct AppState {
@@ -25,15 +26,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_target(false)
+        .compact()
         .init();
 
-    let db_host = env::var("DB_HOST")?;
+    info!("Starting nginx-dovecot-auth");
+
+    let db_host = required_env("DB_HOST")?;
     let db_port: u16 = env::var("DB_PORT")
         .unwrap_or_else(|_| "3306".to_string())
-        .parse()?;
-    let db_user = env::var("DB_USER")?;
-    let db_password = env::var("DB_PASSWORD")?;
-    let db_name = env::var("DB_NAME")?;
+        .parse()
+        .map_err(|e| {
+            error!(error = %e, "Invalid DB_PORT; expected a port number");
+            e
+        })?;
+    let db_user = required_env("DB_USER")?;
+    let db_password = required_env("DB_PASSWORD")?;
+    let db_name = required_env("DB_NAME")?;
+
+    let listen_addr: SocketAddr = env::var("LISTEN_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .parse()
+        .map_err(|e| {
+            error!(error = %e, "Invalid LISTEN_ADDR");
+            e
+        })?;
+
+    info!(
+        db_host = %db_host,
+        db_port,
+        db_name = %db_name,
+        "Connecting to MySQL"
+    );
 
     let options = MySqlConnectOptions::new()
         .host(&db_host)
@@ -42,10 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .password(&db_password)
         .database(&db_name);
 
-    let db = MySqlPoolOptions::new()
+    let db = match MySqlPoolOptions::new()
         .max_connections(10)
         .connect_with(options)
-        .await?;
+        .await
+    {
+        Ok(pool) => {
+            info!("Connected to MySQL successfully");
+            pool
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to connect to MySQL");
+            return Err(e.into());
+        }
+    };
 
     let state = AppState { db };
 
@@ -53,23 +87,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/auth", any(auth_handler))
         .with_state(state);
 
-    let listen_addr: SocketAddr = env::var("LISTEN_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
-        .parse()?;
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(
+                address = %listen_addr,
+                error = %e,
+                "Failed to bind HTTP listener"
+            );
+            return Err(e.into());
+        }
+    };
 
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    info!(address = %listen_addr, "Authentication service listening");
 
-    println!("Authentication service listening on {listen_addr}");
+    if let Err(e) = axum::serve(listener, app).await {
+        error!(error = %e, "HTTP server stopped with an error");
+        return Err(e.into());
+    }
 
-    axum::serve(listener, app).await?;
-
+    info!("Authentication service stopped");
     Ok(())
 }
 
-async fn auth_handler(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+fn required_env(name: &'static str) -> Result<String, Box<dyn std::error::Error>> {
+    env::var(name).map_err(|_| {
+        error!(variable = name, "Missing required environment variable");
+        format!("Missing required environment variable: {name}").into()
+    })
+}
+
+async fn auth_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let started = Instant::now();
+
     let Some((username, password)) = parse_basic_auth(&headers) else {
+        info!("Authentication rejected: missing or invalid Basic Auth credentials");
         return empty_response(StatusCode::UNAUTHORIZED);
     };
+
+    debug!("Basic Auth credentials parsed");
 
     let stored_hash = match sqlx::query_scalar::<_, String>(
         "SELECT password FROM mailbox \
@@ -80,20 +139,33 @@ async fn auth_handler(State(state): State<AppState>, headers: HeaderMap) -> Resp
     .await
     {
         Ok(Some(hash)) => hash,
-        Ok(None) => return empty_response(StatusCode::UNAUTHORIZED),
-        Err(error) => {
-            eprintln!("Database query failed: {error}");
+        Ok(None) => {
+            info!("Authentication rejected: mailbox not found or inactive");
+            return empty_response(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            error!(error = %e, "Database query failed during authentication");
             return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
     if !verify_password(&password, &stored_hash) {
+        info!("Authentication rejected: password verification failed");
         return empty_response(StatusCode::UNAUTHORIZED);
     }
 
-    let Ok(user_header) = HeaderValue::from_str(&username) else {
-        return empty_response(StatusCode::UNAUTHORIZED);
+    let user_header = match HeaderValue::from_str(&username) {
+        Ok(value) => value,
+        Err(_) => {
+            warn!("Authentication rejected: username is invalid for an HTTP header");
+            return empty_response(StatusCode::UNAUTHORIZED);
+        }
     };
+
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Authentication succeeded"
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -106,7 +178,7 @@ fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
     let (scheme, encoded) = value.split_once(' ')?;
 
-    if !scheme.eq_ignore_ascii_case("Basic") || encoded.is_empty() {
+    if !scheme.eq_ignore_ascii_case("Basic") || encoded.trim().is_empty() {
         return None;
     }
 

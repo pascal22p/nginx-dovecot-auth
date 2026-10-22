@@ -1,6 +1,7 @@
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordVerifier},
+    password_hash::phc::PasswordHash,
+    password_hash::PasswordVerifier,
     Algorithm, Argon2, Params, Version,
 };
 
