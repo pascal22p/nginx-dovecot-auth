@@ -13,6 +13,7 @@ use sqlx::{
 };
 use std::{env, net::SocketAddr, time::Instant};
 use tracing::{debug, error, info, warn};
+use axum::http::header::WWW_AUTHENTICATE;
 
 #[derive(Clone)]
 struct AppState {
@@ -52,6 +53,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e
         })?;
 
+    let db_max_connections: u32 = env::var("DB_MAX_CONNECTIONS")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .map_err(|e| {
+            error!(
+                error = %e,
+                "Invalid DB_MAX_CONNECTIONS; expected a positive integer"
+            );
+            e
+        })?;
+
     info!(
         db_host = %db_host,
         db_port,
@@ -67,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .database(&db_name);
 
     let db = match MySqlPoolOptions::new()
-        .max_connections(10)
+        .max_connections(db_max_connections)
         .connect_with(options)
         .await
     {
@@ -125,7 +137,7 @@ async fn auth_handler(
 
     let Some((username, password)) = parse_basic_auth(&headers) else {
         info!("Authentication rejected: missing or invalid Basic Auth credentials");
-        return empty_response(StatusCode::UNAUTHORIZED);
+        return unauthorized_response();
     };
 
     debug!("Basic Auth credentials parsed");
@@ -141,7 +153,7 @@ async fn auth_handler(
         Ok(Some(hash)) => hash,
         Ok(None) => {
             info!("Authentication rejected: mailbox not found or inactive");
-            return empty_response(StatusCode::UNAUTHORIZED);
+            return unauthorized_response();
         }
         Err(e) => {
             error!(error = %e, "Database query failed during authentication");
@@ -151,14 +163,14 @@ async fn auth_handler(
 
     if !verify_password(&password, &stored_hash) {
         info!("Authentication rejected: password verification failed");
-        return empty_response(StatusCode::UNAUTHORIZED);
+        return unauthorized_response();
     }
 
     let user_header = match HeaderValue::from_str(&username) {
         Ok(value) => value,
         Err(_) => {
             warn!("Authentication rejected: username is invalid for an HTTP header");
-            return empty_response(StatusCode::UNAUTHORIZED);
+            return unauthorized_response();
         }
     };
 
@@ -196,6 +208,17 @@ fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
 fn empty_response(status: StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
+        .body(Body::empty())
+        .expect("valid response")
+}
+
+fn unauthorized_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            WWW_AUTHENTICATE,
+            r#"Basic realm="Restricted", charset="UTF-8""#,
+        )
         .body(Body::empty())
         .expect("valid response")
 }

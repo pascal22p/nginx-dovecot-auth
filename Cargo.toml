@@ -14,7 +14,11 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.9", features = ["runtime-tokio-rustls", "mysql"] }
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-none",
+    "mysql",
+] }
 argon2 = "0.6"
 base64 = "0.23"
 subtle = "2.6"
